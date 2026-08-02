@@ -1,0 +1,12 @@
+# env files
+.venv
+
+# cache
+__pycache__/
+
+# os fils
+.DS_Store
+
+# ide settings
+.idea/
+.vscode/
