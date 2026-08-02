@@ -164,7 +164,7 @@ async def run_streaming_job(client_id: str, msg: StartTaskMessage):
             stderr=asyncio.subprocess.STDOUT,
         )
 
-        async def stream_output():
+        async def stream_output(proc: asyncio.subprocess.Process):
             assert proc.stdout is not None
             async for raw_line in proc.stdout:
                 line = raw_line.decode(errors="replace").rstrip()
@@ -175,7 +175,7 @@ async def run_streaming_job(client_id: str, msg: StartTaskMessage):
                 })
 
         # Enforce a timeout on the whole job, not just a single sleep.
-        await asyncio.wait_for(stream_output(), timeout=msg.timeout_seconds)
+        await asyncio.wait_for(stream_output(proc), timeout=msg.timeout_seconds)
         return_code = await proc.wait()
 
         await manager.send_event(client_id, {
@@ -221,6 +221,7 @@ async def run_streaming_job(client_id: str, msg: StartTaskMessage):
 async def worker(worker_id: int):
     while True:
         client_id, msg = await job_queue.get()
+        print(f"[worker {worker_id}] picked up '{msg.task_name}' for client {client_id}")
         try:
             state = manager.clients.get(client_id)
             if state is None:
@@ -268,11 +269,11 @@ async def reaper():
 
 
 # ---------------------------------------------------------------------------
-# 5. Lifespan
+# 5. Lifespan (replaces deprecated @app.on_event)
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(_app: FastAPI):
     workers = [asyncio.create_task(worker(i)) for i in range(WORKER_POOL_SIZE)]
     reaper_task = asyncio.create_task(reaper())
     yield
