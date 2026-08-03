@@ -30,13 +30,13 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, ValidationError
 
 # ---------------------------------------------------------------------------
-# 1. Data model for incoming client messages (validation instead of raw .get())
+# 1. Data model for incoming client messages
 # ---------------------------------------------------------------------------
 
 class StartTaskMessage(BaseModel):
-    action: str  # "start_task" or "cancel_task"
+    action: str
     task_name: str = "unnamed_task"
-    command: str = "echo hello"       # the "work" to run — stand-in for an agent step
+    command: str = "echo hello"
     timeout_seconds: float = 15.0
 
 
@@ -54,14 +54,10 @@ class ClientState:
     consecutive_send_failures: int = 0
 
 
-# Heartbeat tuning:
-# - We wait up to HEARTBEAT_INTERVAL for a client message before sending a ping.
-# - If we get nothing back (no message, no successful send) for CLIENT_TIMEOUT,
-#   the client is considered dead and reaped.
 HEARTBEAT_INTERVAL = 20.0
 CLIENT_TIMEOUT = 45.0
 REAPER_SWEEP_INTERVAL = 10.0
-MAX_SEND_FAILURES = 3  # a few failed sends in a row = treat as dead immediately
+MAX_SEND_FAILURES = 3
 
 
 class ConnectionManager:
@@ -72,9 +68,6 @@ class ConnectionManager:
         await websocket.accept()
         state = ClientState(websocket=websocket)
         self.clients[client_id] = state
-        # Exactly one task ever calls websocket.send_text() for this connection —
-        # everything else just puts events on the outbox. This is what actually
-        # prevents concurrent-send races between workers, the heartbeat, and the reaper.
         state.writer_task = asyncio.create_task(self._writer_loop(client_id, state))
         return state
 
@@ -98,7 +91,7 @@ class ConnectionManager:
         if state is None:
             return
         if state.current_task and not state.current_task.done():
-            state.current_task.cancel()  # stop the job if the client vanished
+            state.current_task.cancel()
         if state.writer_task and not state.writer_task.done():
             state.writer_task.cancel()
 
@@ -111,9 +104,6 @@ class ConnectionManager:
         try:
             state.outbox.put_nowait(event)
         except asyncio.QueueFull:
-            # Backpressure: the client can't keep up. Drop the oldest queued
-            # event rather than blocking the caller (a worker or the reaper) —
-            # staying responsive matters more than delivering every historical line.
             try:
                 state.outbox.get_nowait()
                 state.outbox.put_nowait(event)
@@ -123,11 +113,9 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# Bounded job queue: (client_id, StartTaskMessage) — bounded so a flood of
-# requests can't grow memory unbounded (backpressure).
 job_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
 
-WORKER_POOL_SIZE = 3  # several jobs (from different clients) can run at once
+WORKER_POOL_SIZE = 3
 
 
 # ---------------------------------------------------------------------------
@@ -142,17 +130,8 @@ async def run_streaming_job(client_id: str, msg: StartTaskMessage):
         "task": msg.task_name,
     })
 
-    proc = None  # defensive: guarantees the except blocks below never NameError
+    proc = None
     try:
-        # NOTE: create_subprocess_exec (no shell) is intentional, not an oversight.
-        # It never invokes /bin/sh, so shell metacharacters (| > ; ` $()) in
-        # msg.command are inert — there's no injection vector here. The tradeoff
-        # is real shell features (pipes, redirects, env expansion) don't work,
-        # and malformed quoting raises ValueError instead of a shell error.
-        # Switching to create_subprocess_shell would fix the feature gap but
-        # reopen command injection — don't do that for untrusted client input.
-        # For a real coding agent, the right long-term fix is neither exec nor
-        # shell directly, but a sandboxed/allowlisted execution layer.
         try:
             args = shlex.split(msg.command)
         except ValueError as e:
@@ -174,7 +153,6 @@ async def run_streaming_job(client_id: str, msg: StartTaskMessage):
                     "line": line,
                 })
 
-        # Enforce a timeout on the whole job, not just a single sleep.
         await asyncio.wait_for(stream_output(proc), timeout=msg.timeout_seconds)
         return_code = await proc.wait()
 
@@ -186,7 +164,6 @@ async def run_streaming_job(client_id: str, msg: StartTaskMessage):
         })
 
     except asyncio.CancelledError:
-        # Client cancelled the task or disconnected — kill the subprocess too.
         if proc and proc.returncode is None:
             proc.kill()
             await proc.wait()
@@ -194,7 +171,7 @@ async def run_streaming_job(client_id: str, msg: StartTaskMessage):
             "event": "TASK_CANCELLED",
             "task": msg.task_name,
         })
-        raise  # important: re-raise so asyncio knows cancellation completed
+        raise
 
     except asyncio.TimeoutError:
         if proc and proc.returncode is None:
@@ -225,15 +202,14 @@ async def worker(worker_id: int):
         try:
             state = manager.clients.get(client_id)
             if state is None:
-                continue  # client already gone
+                continue
 
-            # Track the task so a "cancel_task" message or a disconnect can stop it.
             task = asyncio.create_task(run_streaming_job(client_id, msg))
             state.current_task = task
             try:
                 await task
             except asyncio.CancelledError:
-                pass  # already reported via TASK_CANCELLED event
+                pass
         finally:
             job_queue.task_done()
 
@@ -269,7 +245,7 @@ async def reaper():
 
 
 # ---------------------------------------------------------------------------
-# 5. Lifespan (replaces deprecated @app.on_event)
+# 5. Lifespan
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
@@ -300,9 +276,6 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     websocket.receive_text(), timeout=HEARTBEAT_INTERVAL
                 )
             except asyncio.TimeoutError:
-                # No message in a while — ping. If the socket is truly dead this
-                # send will start racking up consecutive_send_failures, and/or
-                # the reaper will catch it once last_seen exceeds CLIENT_TIMEOUT.
                 await manager.send_event(client_id, {"event": "PING"})
                 continue
 
@@ -319,7 +292,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 continue
 
             if msg.action == "pong":
-                continue  # client replying to our PING; last_seen already updated
+                continue
 
             if msg.action == "start_task":
                 try:
