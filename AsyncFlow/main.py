@@ -1,25 +1,16 @@
 """
 Upgraded FastAPI + WebSocket + asyncio.Queue example.
 
-Builds on the "queue feeds a background worker" pattern, but adds the
-pieces you actually need for a coding-agent backend:
-
-  1. Task cancellation (client can stop a running job)
-  2. Streaming output from a real subprocess, line by line
-  3. Timeouts on long-running work
-  4. Graceful handling of client disconnect mid-task
-  5. A small worker pool instead of one serial worker
-  6. Pydantic validation of incoming messages
-  7. `lifespan` instead of the deprecated `on_event`
-  8. A bounded queue for backpressure
+Builds on the "queue feeds a background worker" pattern, with production-ready
+lifecycle management, task cancellation, streaming, and heartbeats.
 
 Run with: uvicorn agent_backend:app --reload
-Test with a simple websocket client (e.g. `websocat ws://localhost:8000/ws/client1`)
-and send: {"action": "start_task", "task_name": "list_files", "command": "ls -la"}
+Test with: websocat ws://localhost:8000/ws/client1
 """
 
 import asyncio
 import json
+import logging
 import shlex
 import time
 from contextlib import asynccontextmanager
@@ -28,6 +19,10 @@ from typing import Dict, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, ValidationError
+
+# Set up logging to stdout
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("asyncflow_backend")
 
 # ---------------------------------------------------------------------------
 # 1. Data model for incoming client messages
@@ -41,7 +36,7 @@ class StartTaskMessage(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# 2. Per-client job tracking, so we can cancel in-flight work
+# 2. Per-client job tracking and Connection Management
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -69,6 +64,7 @@ class ConnectionManager:
         state = ClientState(websocket=websocket)
         self.clients[client_id] = state
         state.writer_task = asyncio.create_task(self._writer_loop(client_id, state))
+        logger.info(f"[connect] Client '{client_id}' connected.")
         return state
 
     async def _writer_loop(self, client_id: str, state: ClientState):
@@ -78,26 +74,33 @@ class ConnectionManager:
                 try:
                     await state.websocket.send_text(json.dumps(event))
                     state.consecutive_send_failures = 0
-                except Exception:
+                except Exception as e:
                     state.consecutive_send_failures += 1
+                    logger.warning(
+                        f"[writer] Failed sending to '{client_id}' "
+                        f"({state.consecutive_send_failures}/{MAX_SEND_FAILURES}): {e}"
+                    )
                     if state.consecutive_send_failures >= MAX_SEND_FAILURES:
-                        self.disconnect(client_id)
+                        logger.error(f"[writer] Dropping client '{client_id}' after consecutive write failures.")
+                        self.disconnect(client_id, reason="max_send_failures")
                         return
         except asyncio.CancelledError:
             pass
 
-    def disconnect(self, client_id: str):
+    def disconnect(self, client_id: str, reason: str = "client_disconnected"):
         state = self.clients.pop(client_id, None)
         if state is None:
             return
+
+        logger.info(f"[disconnect] Client '{client_id}' disconnected (Reason: {reason}).")
+
         if state.current_task and not state.current_task.done():
             state.current_task.cancel()
         if state.writer_task and not state.writer_task.done():
             state.writer_task.cancel()
 
     async def send_event(self, client_id: str, event: dict):
-        """Enqueue an event for delivery. Never calls send_text directly —
-        that's the writer task's job, and only its job."""
+        """Enqueue an event for delivery via the client's outbox writer loop."""
         state = self.clients.get(client_id)
         if state is None:
             return
@@ -112,16 +115,12 @@ class ConnectionManager:
 
 
 manager = ConnectionManager()
-
 job_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
-
 WORKER_POOL_SIZE = 3
 
 
 # ---------------------------------------------------------------------------
-# 3. The actual "work": run a subprocess and stream its stdout line by line.
-#    This is the shape you'll reuse later for "run agent-generated code" or
-#    "stream LLM tokens" — replace the subprocess call with your real logic.
+# 3. Subprocess execution with live output streaming
 # ---------------------------------------------------------------------------
 
 async def run_streaming_job(client_id: str, msg: StartTaskMessage):
@@ -165,8 +164,11 @@ async def run_streaming_job(client_id: str, msg: StartTaskMessage):
 
     except asyncio.CancelledError:
         if proc and proc.returncode is None:
-            proc.kill()
-            await proc.wait()
+            try:
+                proc.kill()
+                await proc.wait()
+            except ProcessLookupError:
+                pass
         await manager.send_event(client_id, {
             "event": "TASK_CANCELLED",
             "task": msg.task_name,
@@ -175,8 +177,11 @@ async def run_streaming_job(client_id: str, msg: StartTaskMessage):
 
     except asyncio.TimeoutError:
         if proc and proc.returncode is None:
-            proc.kill()
-            await proc.wait()
+            try:
+                proc.kill()
+                await proc.wait()
+            except ProcessLookupError:
+                pass
         await manager.send_event(client_id, {
             "event": "TASK_FAILED",
             "task": msg.task_name,
@@ -192,13 +197,13 @@ async def run_streaming_job(client_id: str, msg: StartTaskMessage):
 
 
 # ---------------------------------------------------------------------------
-# 4. Worker pool: several workers pull from the same queue concurrently.
+# 4. Worker pool & Reaper background tasks
 # ---------------------------------------------------------------------------
 
 async def worker(worker_id: int):
     while True:
         client_id, msg = await job_queue.get()
-        print(f"[worker {worker_id}] picked up '{msg.task_name}' for client {client_id}")
+        logger.info(f"[worker {worker_id}] picked up '{msg.task_name}' for client '{client_id}'")
         try:
             state = manager.clients.get(client_id)
             if state is None:
@@ -210,16 +215,12 @@ async def worker(worker_id: int):
                 await task
             except asyncio.CancelledError:
                 pass
+            finally:
+                if state.current_task == task:
+                    state.current_task = None
         finally:
             job_queue.task_done()
 
-
-# ---------------------------------------------------------------------------
-# 4b. Reaper: periodically sweep for clients that have gone silent. This is
-#     what catches "dead" connections — sockets that never raised
-#     WebSocketDisconnect because the network just vanished (sleep, wifi
-#     drop, phone backgrounded) rather than closing cleanly.
-# ---------------------------------------------------------------------------
 
 async def reaper():
     while True:
@@ -233,25 +234,31 @@ async def reaper():
             state = manager.clients.get(cid)
             if state is None:
                 continue
+
+            logger.warning(f"[reaper] Client '{cid}' timed out (inactive for {now - state.last_seen:.1f}s). Closing connection.")
+
             if state.current_task and not state.current_task.done():
-                state.current_task.cancel()  # don't leak a running job
+                state.current_task.cancel()
             if state.writer_task and not state.writer_task.done():
                 state.writer_task.cancel()
+
             try:
                 await state.websocket.close(code=1001, reason="heartbeat timeout")
-            except Exception:
-                pass  # already gone; closing is best-effort
-            manager.clients.pop(cid, None)
+            except Exception as e:
+                logger.debug(f"[reaper] Socket close failed for '{cid}': {e}")
+
+            manager.disconnect(cid, reason="heartbeat_timeout")
 
 
 # ---------------------------------------------------------------------------
-# 5. Lifespan
+# 5. Lifespan Context Manager
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     workers = [asyncio.create_task(worker(i)) for i in range(WORKER_POOL_SIZE)]
     reaper_task = asyncio.create_task(reaper())
+    logger.info("Server started. Background workers and reaper initialized.")
     yield
     reaper_task.cancel()
     for w in workers:
@@ -263,7 +270,7 @@ app = FastAPI(lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
-# 6. WebSocket endpoint: validates input, supports start + cancel
+# 6. WebSocket Endpoint
 # ---------------------------------------------------------------------------
 
 @app.websocket("/ws/{client_id}")
@@ -275,11 +282,10 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 raw = await asyncio.wait_for(
                     websocket.receive_text(), timeout=HEARTBEAT_INTERVAL
                 )
+                state.last_seen = time.monotonic()
             except asyncio.TimeoutError:
                 await manager.send_event(client_id, {"event": "PING"})
                 continue
-
-            state.last_seen = time.monotonic()
 
             try:
                 payload = json.loads(raw)
@@ -318,4 +324,4 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     })
 
     except WebSocketDisconnect:
-        manager.disconnect(client_id)
+        manager.disconnect(client_id, reason="clean_disconnect")
