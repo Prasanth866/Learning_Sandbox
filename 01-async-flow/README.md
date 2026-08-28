@@ -1,10 +1,10 @@
-# AsyncFlow
+# async-flow
 
-Concise notes on the concurrency patterns, lifecycle handling, and WebSocket streaming architecture in `AsyncFlow`.
+Concise notes on the concurrency patterns, lifecycle handling, and WebSocket streaming architecture in `async-flow`.
 
 ---
 
-## 1. What AsyncFlow Is
+## 1. What async-flow Is
 
 An in-memory backend built with **FastAPI**, **WebSockets**, and **`asyncio`** that simulates how AI coding agents run terminal commands, stream outputs in real time, and handle task lifecycles safely.
 
@@ -17,17 +17,18 @@ An in-memory backend built with **FastAPI**, **WebSockets**, and **`asyncio`** t
 
 ---
 
-## 2. Core Architecture & Components (`main.py`)
+## 2. Core Architecture & Components
 
-| Component | Responsibility |
-|---|---|
-| **`ConnectionManager` & `ClientState`** | Tracks active clients, manages per-client outbox queues, and isolates outbound socket writes. |
-| **`job_queue` (`asyncio.Queue`)** | Bounded queue (capacity 50) holding `(client_id, StartTaskMessage)` tuples. |
-| **Worker Pool (`worker`)** | 3 long-running async worker tasks consuming jobs off `job_queue`. |
-| **Streaming Runner (`run_streaming_job`)** | Spawns subprocesses, streams lines from `stdout`, handles timeouts and cancellations. |
-| **Reaper (`reaper`)** | Background task sweeping every 10s to drop zombie connections silent for >45s. |
-| **Lifespan Manager (`lifespan`)** | Initializes and cleans up worker tasks and the reaper on server startup/shutdown. |
-| **WebSocket Handler (`/ws/{client_id}`)** | Parses client JSON messages, manages incoming heartbeat intervals, and dispatches actions. |
+| Component | File | Responsibility |
+|---|---|---|
+| **`ConnectionManager` & `ClientState`** | `manager.py`, `models.py` | Tracks active clients, manages per-client outbox queues, and isolates outbound socket writes. |
+| **`job_queue` (`asyncio.Queue`)** | `worker.py` | Bounded queue (capacity 50) holding `(client_id, StartTaskMessage)` tuples. |
+| **Worker Pool (`worker`)** | `worker.py` | 3 long-running async worker tasks consuming jobs off `job_queue`. |
+| **Streaming Runner (`run_streaming_job`)** | `runner.py` | Spawns subprocesses, streams lines from `stdout`, handles timeouts and cancellations. |
+| **Reaper (`reaper`)** | `worker.py` | Background task sweeping every 10s to drop zombie connections silent for >45s. |
+| **Lifespan Manager (`lifespan`)** | `main.py` | Initializes and cleans up worker tasks and the reaper on server startup/shutdown. |
+| **WebSocket Handler (`/ws/{client_id}`)** | `main.py` | Parses client JSON messages, manages incoming heartbeat intervals, and dispatches actions. |
+| **Configuration & Logging** | `config.py` | Application constants, timeouts, buffer sizes, and logger setup. |
 
 ---
 

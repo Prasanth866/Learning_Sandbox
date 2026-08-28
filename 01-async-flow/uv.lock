@@ -33,7 +33,7 @@ wheels = [
 ]
 
 [[package]]
-name = "asyncflow"
+name = "async-flow"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
