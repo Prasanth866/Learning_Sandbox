@@ -1,11 +1,12 @@
-# OS generated files
-.DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
+# Environment Variables & Secrets
+.env
+.env.local
+*.env.local
+
+# Virtual Environments
+venv/
+.venv/
+env/
 
 # IDE & Editor files
 .idea/
@@ -13,17 +14,22 @@ Thumbs.db
 *.swp
 *.swo
 
-# Environment variables & secrets
-.env
-*.env.local
+# Jupyter Notebook Artifacts
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
 
-# Python / General build & cache artifacts
+# Local Vector Stores & Databases (CRITICAL)
+db/
+chroma_db/
+langgraph_checkpoints/
+*.sqlite
+*.sqlite3
+*.db
+
+# Python / General Build & Cache Artifacts
 __pycache__/
 *.py[cod]
 *$py.class
-.venv/
-env/
-venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -32,3 +38,12 @@ venv/
 node_modules/
 dist/
 build/
+
+# OS Generated Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
