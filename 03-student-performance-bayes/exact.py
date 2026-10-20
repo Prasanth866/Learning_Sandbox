@@ -1,59 +1,23 @@
-"""Exact inference algorithms for Bayesian Networks.
-
-This module implements exact inference algorithms:
-- Enumeration: brute-force summation over all possible assignments
-- Variable Elimination: efficient algorithm using factor product and marginalization
-"""
-
 from __future__ import annotations
-
 import itertools
 import numpy as np
-from typing import Dict, List, Tuple, Optional
-
+from typing import Dict, List, Optional
 from network import BayesNet
 from factor import Factor
 
-
-def enumeration_ask(
-    bn: BayesNet,
-    query: str,
-    evidence: Dict[str, str | int],
-) -> Dict[str, float]:
-    """Exact inference using enumeration.
-
-    Computes P(query | evidence) by enumerating all possible assignments to
-    the remaining variables and summing over them.
-
-    Parameters
-    ----------
-    bn : BayesNet
-        The Bayesian Network.
-    query : str
-        The variable to query.
-    evidence : Dict[str, str | int]
-        Observed variable assignments.
-
-    Returns
-    -------
-    Dict[str, float]
-        A dictionary mapping query states to their posterior probabilities.
-    """
+def enumeration_ask(bn: BayesNet, query: str, evidence: Dict[str, str | int]) -> Dict[str, float]:
     if query not in bn.nodes:
-        raise ValueError(f"Query variable {query} not in network.")
-
+        raise ValueError(f'Query variable {query} not in network.')
     int_evidence = {}
     for var, val in evidence.items():
         if var not in bn.nodes:
-            raise ValueError(f"Evidence variable {var} not in network.")
+            raise ValueError(f'Evidence variable {var} not in network.')
         if isinstance(val, str):
             int_evidence[var] = bn.states[var].index(val)
         else:
             int_evidence[var] = val
-
     all_vars = bn.nodes
     remaining_vars = [var for var in all_vars if var not in int_evidence and var != query]
-
     assignments = []
     if not remaining_vars:
         assignments = [{}]
@@ -63,73 +27,37 @@ def enumeration_ask(
             for var, idx in zip(remaining_vars, assignment):
                 full_assignment[var] = idx
             assignments.append(full_assignment)
-
     query_states = bn.states[query]
     posterior = {state: 0.0 for state in query_states}
-
     for state_idx, state in enumerate(query_states):
         partial_assignment = {**int_evidence, query: state_idx}
-
         for assignment in assignments:
             full_assignment = {**partial_assignment, **assignment}
             posterior[state] += bn.joint_probability(full_assignment)
-
     total = sum(posterior.values())
     if total == 0:
-        raise ValueError("Posterior probability sums to zero.")
+        raise ValueError('Posterior probability sums to zero.')
     for state in query_states:
         posterior[state] /= total
-
     return posterior
 
-
-def variable_elimination(
-    bn: BayesNet,
-    query: str,
-    evidence: Dict[str, str | int],
-    order: Optional[List[str]] = None,
-) -> Dict[str, float]:
-    """Exact inference using variable elimination.
-
-    Computes P(query | evidence) by eliminating variables one at a time.
-
-    Parameters
-    ----------
-    bn : BayesNet
-        The Bayesian Network.
-    query : str
-        The variable to query.
-    evidence : Dict[str, str | int]
-        Observed variable assignments.
-    order : List[str], optional
-        Elimination order. If None, uses min-fill heuristic.
-
-    Returns
-    -------
-    Dict[str, float]
-        A dictionary mapping query states to their posterior probabilities.
-    """
+def variable_elimination(bn: BayesNet, query: str, evidence: Dict[str, str | int], order: Optional[List[str]]=None) -> Dict[str, float]:
     if query not in bn.nodes:
-        raise ValueError(f"Query variable {query} not in network.")
-
+        raise ValueError(f'Query variable {query} not in network.')
     int_evidence = {}
     for var, val in evidence.items():
         if var not in bn.nodes:
-            raise ValueError(f"Evidence variable {var} not in network.")
+            raise ValueError(f'Evidence variable {var} not in network.')
         if isinstance(val, str):
             int_evidence[var] = bn.states[var].index(val)
         else:
             int_evidence[var] = val
-
     all_vars = bn.nodes
     hidden_vars = [var for var in all_vars if var not in int_evidence and var != query]
-
     if order is None:
         order = min_fill_order(bn, hidden_vars, int_evidence)
-    else:
-        if not set(order).issubset(set(hidden_vars)):
-            raise ValueError("Elimination order contains variables not in hidden non-evidence variables.")
-
+    elif not set(order).issubset(set(hidden_vars)):
+        raise ValueError('Elimination order contains variables not in hidden non-evidence variables.')
     factors = []
     for var in all_vars:
         f = bn.cpts[var]
@@ -137,105 +65,50 @@ def variable_elimination(
         if ev:
             f = f.reduce(ev)
         factors.append(f)
-
     for var in order:
         factors_with_var = [f for f in factors if var in f.variables]
         factors = [f for f in factors if var not in f.variables]
-
         if not factors_with_var:
             continue
-
         prod = factors_with_var[0]
         for f in factors_with_var[1:]:
             prod = prod.product(f)
-
         new_f = prod.marginalize([var])
         if new_f.variables:
             factors.append(new_f)
-
     if not factors:
         return {s: 1.0 / len(bn.states[query]) for s in bn.states[query]}
-
     final_factor = factors[0]
     for f in factors[1:]:
         final_factor = final_factor.product(f)
-
     final_factor = final_factor.normalize()
     query_states = bn.states[query]
     posterior = {query_states[i]: float(final_factor.values[i]) for i in range(len(query_states))}
-
     return posterior
 
-
 def min_fill_order(bn: BayesNet, variables: List[str], evidence: Dict[str, int]) -> List[str]:
-    """Compute an elimination order using the min-fill heuristic.
-
-    Parameters
-    ----------
-    bn : BayesNet
-        The Bayesian Network.
-    variables : List[str]
-        Variables to order.
-    evidence : Dict[str, int]
-        Observed variable assignments.
-
-    Returns
-    -------
-    List[str]
-        Elimination order.
-    """
     remaining_vars = variables.copy()
     order = []
-
     while remaining_vars:
         min_fill = -1
         best_var = None
-
         for var in remaining_vars:
             neighbors = set()
             neighbors.update(bn.parents[var])
             neighbors.update(bn.children[var])
             for child in bn.children[var]:
                 neighbors.update(bn.parents[child])
-
             neighbors = [n for n in neighbors if n in remaining_vars and n not in evidence]
-
             fill = len(neighbors)
-
             if best_var is None or fill < min_fill:
                 min_fill = fill
                 best_var = var
-
         order.append(best_var)
         remaining_vars.remove(best_var)
-
     return order
-
-
 variable_elimination.min_fill_order = min_fill_order
 
-
-def create_evidence_factor(
-    bn: BayesNet,
-    var: str,
-    state_idx: int,
-) -> Factor:
-    """Create a factor that represents the evidence.
-
-    Parameters
-    ----------
-    bn : BayesNet
-        The Bayesian Network.
-    var : str
-        Variable that is observed.
-    state_idx : int
-        Index of the observed state.
-
-    Returns
-    -------
-    Factor
-        A factor that is 1 for the observed state and 0 for all other states.
-    """
+def create_evidence_factor(bn: BayesNet, var: str, state_idx: int) -> Factor:
     values = np.zeros(len(bn.states[var]))
     values[state_idx] = 1.0
     return Factor([var], [len(bn.states[var])], values)
